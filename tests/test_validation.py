@@ -1,4 +1,3 @@
-
 from src.validation import validate_records
 
 
@@ -41,6 +40,20 @@ def test_null_required_field():
 
     assert len(valid) == 0
     assert len(rejected) == 1
+
+
+def test_blank_required_field():
+    records = [
+        {"id": 1, "name": ""},
+        {"id": 2, "name": "   "}
+    ]
+
+    valid, rejected = validate_records(
+        records, ["id", "name"], "id"
+    )
+
+    assert len(valid) == 0
+    assert len(rejected) == 2
 
 
 def test_duplicate_records():
