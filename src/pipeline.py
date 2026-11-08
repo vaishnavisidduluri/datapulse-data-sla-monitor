@@ -5,7 +5,7 @@ import uuid
 from pathlib import Path
 from datetime import datetime, timezone
 
-from src.config import timestamp_to_string
+from src.config import timestamp_to_string, parse_timestamp
 from src.database import get_connection, get_dataset_config
 from src.ingestion import ingest_csv
 from src.transformation import transform_records
@@ -39,16 +39,35 @@ def run_pipeline(
     lowercase_fields=None,
     timestamp_fields=None,
     as_of=None,
-    db_path=None
+    db_path=None,
+    arrival_at=None
 ):
     """
     Execute the complete DataPulse pipeline.
+
+    Parameters:
+        dataset_name: Name of the dataset.
+        file_path: Input CSV file path.
+        required_fields: Required CSV columns.
+        primary_key: Unique record identifier.
+        timestamp_field: Field used for freshness monitoring.
+        lowercase_fields: Fields to convert to lowercase.
+        timestamp_fields: Fields to convert to UTC timestamps.
+        as_of: Optional timezone-aware evaluation timestamp.
+        db_path: Optional custom SQLite database path.
+        arrival_at: Optional actual data arrival timestamp.
+
+    If arrival_at is not supplied, evaluation_time is used as a
+    backward-compatible fallback. For accurate arrival SLA tracking,
+    provide the actual arrival timestamp.
     """
 
     file_path = Path(file_path)
 
     if not file_path.exists():
-        raise FileNotFoundError(f"Input file not found: {file_path}")
+        raise FileNotFoundError(
+            f"Input file not found: {file_path}"
+        )
 
     # 1. Load saved dataset configuration
     if db_path is not None:
@@ -66,10 +85,32 @@ def run_pipeline(
             f"Dataset {dataset_name} is disabled."
         )
 
+    # 2. Capture pipeline execution and evaluation timestamps
     started_at = datetime.now(timezone.utc)
     started_at_string = timestamp_to_string(started_at)
 
-    evaluation_time = as_of if as_of is not None else started_at
+    if as_of is not None:
+        evaluation_time = parse_timestamp(as_of)
+    else:
+        evaluation_time = started_at
+
+    evaluation_time = evaluation_time.astimezone(timezone.utc)
+
+    # Use actual arrival time when provided.
+    # Otherwise, preserve compatibility with existing callers.
+    if arrival_at is not None:
+        actual_arrival = parse_timestamp(arrival_at)
+    else:
+        actual_arrival = evaluation_time
+
+    actual_arrival = actual_arrival.astimezone(timezone.utc)
+
+    if actual_arrival > evaluation_time:
+        raise ValueError(
+            "Arrival timestamp cannot be later than evaluation time."
+        )
+
+    actual_arrival_string = timestamp_to_string(actual_arrival)
 
     run_id = str(uuid.uuid4())
     load_id = str(uuid.uuid4())
@@ -83,7 +124,7 @@ def run_pipeline(
     load_created = False
 
     try:
-        # 2. Create pipeline run
+        # 3. Create pipeline run
         connection.execute(
             """
             INSERT INTO dataset_runs (
@@ -93,9 +134,10 @@ def run_pipeline(
             """,
             (run_id, started_at_string)
         )
+
         connection.commit()
 
-        # 3. Determine expected arrival
+        # 4. Determine expected arrival from saved schedule
         expected_arrival = latest_expected_arrival(
             schedule,
             evaluation_time
@@ -110,10 +152,10 @@ def run_pipeline(
             expected_arrival
         )
 
-        # 4. Calculate input fingerprint
+        # 5. Calculate input fingerprint
         fingerprint = calculate_file_fingerprint(file_path)
 
-        # 5. Create or reuse dataset load
+        # 6. Create or reuse dataset load
         connection.execute(
             """
             INSERT INTO dataset_loads (
@@ -152,7 +194,7 @@ def run_pipeline(
         connection.commit()
         load_created = True
 
-        # 6. Ingest and validate CSV
+        # 7. Ingest and validate CSV
         valid_records, rejected_records = ingest_csv(
             file_path,
             required_fields,
@@ -161,14 +203,14 @@ def run_pipeline(
 
         input_count = len(valid_records) + len(rejected_records)
 
-        # 7. Transform valid records
+        # 8. Transform valid records
         transformed_records = transform_records(
             valid_records,
             lowercase_fields=lowercase_fields,
             timestamp_fields=timestamp_fields
         )
 
-        # 8. Store processed records
+        # 9. Store processed records
         stored_count = store_records(
             dataset_name,
             transformed_records,
@@ -176,7 +218,22 @@ def run_pipeline(
             db_path
         )
 
-        # 9. Save rejected records
+        # 10. Data reconciliation checks
+        if input_count != (
+            len(transformed_records) + len(rejected_records)
+        ):
+            raise ValueError(
+                "Data reconciliation failed: input count does not "
+                "match valid and rejected record counts."
+            )
+
+        if stored_count != len(transformed_records):
+            raise ValueError(
+                "Data reconciliation failed: stored count does not "
+                "match transformed record count."
+            )
+
+        # 11. Save rejected records
         for rejected in rejected_records:
             connection.execute(
                 """
@@ -205,7 +262,7 @@ def run_pipeline(
 
         connection.commit()
 
-        # 10. Calculate data freshness
+        # 12. Calculate data freshness
         freshness_result = calculate_freshness(
             transformed_records,
             timestamp_field,
@@ -213,19 +270,19 @@ def run_pipeline(
             as_of=evaluation_time
         )
 
-        # 11. Evaluate arrival SLA
+        # 13. Evaluate arrival SLA using actual arrival time
         arrival_result = evaluate_arrival_sla(
             schedule,
             arrivals=[
                 {
                     "expected_arrival": expected_arrival_string,
-                    "arrived_at": started_at_string
+                    "arrived_at": actual_arrival_string
                 }
             ],
             as_of=evaluation_time
         )
 
-        # 12. Evaluate completion SLA
+        # 14. Evaluate pipeline completion SLA
         finished_at = datetime.now(timezone.utc)
         finished_at_string = timestamp_to_string(finished_at)
 
@@ -236,7 +293,7 @@ def run_pipeline(
             as_of=evaluation_time
         )
 
-        # 13. Generate and save alerts
+        # 15. Generate and save alerts
         alerts = generate_alerts(
             dataset_name,
             arrival_result=arrival_result,
@@ -250,7 +307,7 @@ def run_pipeline(
             db_path=db_path
         )
 
-        # 14. Determine final run status
+        # 16. Determine final run status
         final_status = (
             "PARTIAL" if rejected_records else "SUCCESS"
         )
@@ -300,7 +357,7 @@ def run_pipeline(
 
         connection.commit()
 
-        # 15. Return pipeline summary
+        # 17. Return pipeline summary
         return {
             "run_id": run_id,
             "dataset_name": dataset_name,
@@ -311,9 +368,10 @@ def run_pipeline(
             "stored_count": stored_count,
             "alert_count": saved_alert_count,
             "arrival_status": arrival_result["status"],
+            "expected_arrival": expected_arrival_string,
+            "actual_arrival": actual_arrival_string,
             "completion_status": completion_result["status"],
-            "freshness_status": freshness_result["status"],
-            "expected_arrival": expected_arrival_string
+            "freshness_status": freshness_result["status"]
         }
 
     except Exception as error:
@@ -342,7 +400,10 @@ def run_pipeline(
                     completed_at = ?
                 WHERE run_id = ?
                 """,
-                (timestamp_to_string(), run_id)
+                (
+                    timestamp_to_string(),
+                    run_id
+                )
             )
 
         connection.commit()

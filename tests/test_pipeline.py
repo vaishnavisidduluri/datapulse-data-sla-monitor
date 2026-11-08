@@ -10,11 +10,12 @@ from src.database import (
 from src.pipeline import run_pipeline
 
 
-def setup_pipeline_test(tmp_path):
+def setup_pipeline_test(tmp_path, as_of=None):
     db_path = tmp_path / "pipeline_test.db"
     initialize_database(db_path)
 
-    as_of = datetime.now(timezone.utc)
+    if as_of is None:
+        as_of = datetime.now(timezone.utc)
 
     schedule = {
         "dataset_name": "customers",
@@ -146,3 +147,64 @@ def test_pipeline_handles_rejected_records(tmp_path):
     connection.close()
 
     assert rejected_count == 1
+
+
+def test_pipeline_supports_historical_backfill(tmp_path):
+    # Use a fixed historical evaluation timestamp
+    historical_as_of = datetime(
+        2025, 1, 15, 12, 0, tzinfo=timezone.utc
+    )
+
+    db_path, as_of = setup_pipeline_test(
+        tmp_path,
+        historical_as_of
+    )
+
+    event_time = (
+        as_of - timedelta(minutes=1)
+    ).isoformat()
+
+    file_path = create_csv(tmp_path, [
+        {
+            "id": "BACKFILL001",
+            "name": "Historical Customer",
+            "event_time": event_time
+        }
+    ])
+
+    result = run_pipeline(
+        dataset_name="customers",
+        file_path=file_path,
+        required_fields=["id", "name", "event_time"],
+        primary_key="id",
+        timestamp_field="event_time",
+        timestamp_fields=["event_time"],
+        as_of=historical_as_of,
+        db_path=db_path
+    )
+
+    expected_arrival = (
+        historical_as_of - timedelta(minutes=5)
+    ).isoformat()
+
+    assert result["status"] == "SUCCESS"
+    assert result["input_count"] == 1
+    assert result["valid_count"] == 1
+    assert result["rejected_count"] == 0
+    assert result["stored_count"] == 1
+    assert result["expected_arrival"] == expected_arrival
+
+    connection = get_connection(db_path)
+
+    stored_record = connection.execute(
+        """
+        SELECT record_id
+        FROM processed_records
+        WHERE dataset_name = ?
+        """,
+        ("customers",)
+    ).fetchone()
+
+    connection.close()
+
+    assert stored_record[0] == "BACKFILL001"

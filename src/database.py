@@ -166,34 +166,52 @@ ON alerts(dataset_name);
 
 
 # --------------------------------------------------
+# DATABASE PATH RESOLUTION
+# --------------------------------------------------
+
+def _resolve_db_path(db_path=None):
+    """
+    Resolve the database path at runtime.
+
+    If a custom path is provided, use it.
+    Otherwise, use the current module-level DB_PATH.
+
+    Resolving at runtime allows tests to temporarily replace DB_PATH.
+    """
+
+    if db_path is None:
+        db_path = DB_PATH
+
+    return Path(db_path)
+
+
+# --------------------------------------------------
 # DATABASE CONNECTION
 # --------------------------------------------------
 
-def get_connection(db_path=DB_PATH):
+def get_connection(db_path=None):
     """
     Create a SQLite database connection.
 
-    Uses the main database by default.
-    Can also connect to temporary databases during testing.
+    Uses the current default database path when no path is supplied.
+    Supports custom database paths for testing.
     """
 
-    db_path = Path(db_path)
+    resolved_path = _resolve_db_path(db_path)
 
-    # Create database directory if it does not exist
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_path.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
     connection = sqlite3.connect(
-        db_path,
+        resolved_path,
         timeout=30
     )
 
-    # Return rows as dictionary-like objects
     connection.row_factory = sqlite3.Row
 
-    # Enable foreign key constraints
     connection.execute("PRAGMA foreign_keys = ON")
-
-    # Wait for database locks
     connection.execute("PRAGMA busy_timeout = 30000")
 
     return connection
@@ -203,7 +221,7 @@ def get_connection(db_path=DB_PATH):
 # INITIALIZE DATABASE
 # --------------------------------------------------
 
-def initialize_database(db_path=DB_PATH):
+def initialize_database(db_path=None):
     """
     Create all database tables and indexes.
 
@@ -226,12 +244,11 @@ def initialize_database(db_path=DB_PATH):
 # INSERT OR UPDATE DATASET CONFIGURATION
 # --------------------------------------------------
 
-def upsert_dataset_config(schedule, db_path=DB_PATH):
+def upsert_dataset_config(schedule, db_path=None):
     """
     Insert a new dataset configuration.
 
-    If the dataset already exists, update its configuration
-    instead of creating a duplicate row.
+    If the dataset already exists, update its configuration.
     """
 
     from src.scheduling import validate_schedule
@@ -307,7 +324,7 @@ def upsert_dataset_config(schedule, db_path=DB_PATH):
 # GET ENABLED DATASET CONFIGURATIONS
 # --------------------------------------------------
 
-def get_dataset_configs(db_path=DB_PATH):
+def get_dataset_configs(db_path=None):
     """
     Retrieve all enabled dataset configurations.
     """
@@ -334,7 +351,7 @@ def get_dataset_configs(db_path=DB_PATH):
 # GET ONE DATASET CONFIGURATION
 # --------------------------------------------------
 
-def get_dataset_config(dataset_name, db_path=DB_PATH):
+def get_dataset_config(dataset_name, db_path=None):
     """
     Retrieve configuration for a particular dataset.
     """
